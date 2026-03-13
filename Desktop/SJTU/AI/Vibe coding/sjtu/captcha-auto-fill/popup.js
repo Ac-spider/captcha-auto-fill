@@ -27,6 +27,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   const apiKeyHint = document.getElementById('apiKeyHint');
   const apiKeyLink = document.getElementById('apiKeyLink');
 
+  // 账号设置元素
+  const jaccountUser = document.getElementById('jaccountUser');
+  const jaccountPass = document.getElementById('jaccountPass');
+  const autoFillCredentialsCheck = document.getElementById('autoFillCredentialsCheck');
+
   // 当前识别的验证码
   let currentCaptcha = null;
 
@@ -139,7 +144,10 @@ document.addEventListener('DOMContentLoaded', async () => {
       'baiduApiKey',
       'baiduSecretKey',
       'aliyunAccessKey',
-      'aliyunAccessSecret'
+      'aliyunAccessSecret',
+      'jaccountUser',
+      'jaccountPass',
+      'autoFillCredentials'
     ]);
 
     toggleSwitch.checked = settings.enabled !== false;
@@ -158,6 +166,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // 恢复 API Key
     restoreApiKeys(settings);
+
+    // 恢复账号设置
+    if (settings.jaccountUser) {
+      jaccountUser.value = settings.jaccountUser;
+    }
+    if (settings.jaccountPass) {
+      jaccountPass.value = settings.jaccountPass;
+    }
+    autoFillCredentialsCheck.checked = settings.autoFillCredentials === true;
 
     updateStatusUI(toggleSwitch.checked);
     await refreshStatus();
@@ -453,6 +470,39 @@ document.addEventListener('DOMContentLoaded', async () => {
         await chrome.storage.sync.set({ [config.secretName]: apiSecretInput.value.trim() });
       }
     }, 500);
+  });
+
+  // 用户名输入防抖保存
+  jaccountUser.addEventListener('input', async () => {
+    clearTimeout(apiKeyDebounceTimer);
+    apiKeyDebounceTimer = setTimeout(async () => {
+      await chrome.storage.sync.set({ jaccountUser: jaccountUser.value.trim() });
+    }, 500);
+  });
+
+  // 密码输入防抖保存
+  jaccountPass.addEventListener('input', async () => {
+    clearTimeout(apiKeyDebounceTimer);
+    apiKeyDebounceTimer = setTimeout(async () => {
+      await chrome.storage.sync.set({ jaccountPass: jaccountPass.value });
+    }, 500);
+  });
+
+  // 自动填充账号密码设置
+  autoFillCredentialsCheck.addEventListener('change', async () => {
+    await chrome.storage.sync.set({ autoFillCredentials: autoFillCredentialsCheck.checked });
+
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (tab) {
+        await chrome.tabs.sendMessage(tab.id, {
+          action: 'autoFillCredentialsChanged',
+          enabled: autoFillCredentialsCheck.checked
+        });
+      }
+    } catch (error) {
+      console.log('无法与内容脚本通信:', error);
+    }
   });
 
   // 监听来自内容脚本的消息

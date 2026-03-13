@@ -11,9 +11,15 @@
   let isProcessing = false;
   let recognizedCaptcha = null;
   let isOneClickLoginMode = false;  // 一键登录模式标志
-  let loginRetryCount = 0;          // 登录重试计数
-  const MAX_RETRY_COUNT = 3;        // 最大重试次数
   let oneClickLoginEnabled = false; // 一键登录功能是否启用
+  let autoLoginTriggered = false;   // 自动登录是否已触发（防止重复提交）
+  let isLoggingIn = false;          // 是否正在登录过程中（防止页面跳转时重复检测）
+  let autoFillCredentials = false;  // 是否自动填充用户名密码
+  let credentialsFilled = false;    // 是否已经填充过账号密码（防止重复填充）
+  let jaccountUser = '';            // 保存的jAccount用户名
+  let jaccountPass = '';            // 保存的jAccount密码
+  let loginRetryCount = 0;          // 登录重试次数计数器
+  const MAX_LOGIN_RETRIES = 3;      // 最大登录重试次数
 
   // 验证码特征关键词
   const CAPTCHA_KEYWORDS = [
@@ -35,10 +41,29 @@
   function init() {
     console.log('[Captcha Auto-Fill] 内容脚本已加载');
 
+    // 重置登录状态标志
+    isLoggingIn = false;
+    autoLoginTriggered = false;
+    isOneClickLoginMode = false;
+    credentialsFilled = false;  // 重置账号填充标志
+    loginRetryCount = 0;        // 重置登录重试计数器
+
     // 从存储中读取设置
-    chrome.storage.sync.get(['enabled', 'oneClickLogin'], (result) => {
+    chrome.storage.sync.get(['enabled', 'oneClickLogin', 'autoFillCredentials', 'jaccountUser', 'jaccountPass'], (result) => {
       isEnabled = result.enabled !== false;
       oneClickLoginEnabled = result.oneClickLogin === true;
+      autoFillCredentials = result.autoFillCredentials === true;
+      jaccountUser = result.jaccountUser || '';
+      jaccountPass = result.jaccountPass || '';
+
+      console.log('[Captcha Auto-Fill] 设置加载完成:', {
+        enabled: isEnabled,
+        oneClickLogin: oneClickLoginEnabled,
+        autoFillCredentials: autoFillCredentials,
+        hasUser: !!jaccountUser,
+        hasPass: !!jaccountPass
+      });
+
       if (isEnabled) {
         startCaptchaDetection();
       }
@@ -183,8 +208,10 @@
 
       case 'fillCaptcha':
         if (request.text) {
-          const success = fillCaptchaInput(request.text);
-          sendResponse({ success });
+          fillCaptchaInput(request.text).then(success => {
+            sendResponse({ success });
+          });
+          return true; // 保持消息通道开启
         }
         break;
 
@@ -211,6 +238,21 @@
         // 一键登录设置已更改
         oneClickLoginEnabled = request.enabled;
         console.log('[Captcha Auto-Fill] 一键登录已' + (oneClickLoginEnabled ? '启用' : '禁用'));
+        sendResponse({ success: true });
+        break;
+
+      case 'autoFillCredentialsChanged':
+        // 自动填充账号密码设置已更改
+        autoFillCredentials = request.enabled;
+        console.log('[Captcha Auto-Fill] 自动填充账号密码已' + (autoFillCredentials ? '启用' : '禁用'));
+        sendResponse({ success: true });
+        break;
+
+      case 'updateCredentials':
+        // 更新保存的账号密码
+        jaccountUser = request.user || '';
+        jaccountPass = request.pass || '';
+        console.log('[Captcha Auto-Fill] 账号密码已更新');
         sendResponse({ success: true });
         break;
 
@@ -527,6 +569,12 @@
       return;
     }
 
+    // 关键修复：如果正在登录过程中，跳过新的验证码检测
+    if (isLoggingIn) {
+      console.log('[Captcha Auto-Fill] 正在登录过程中，跳过验证码检测');
+      return;
+    }
+
     isProcessing = true;
     recognizedCaptcha = null;
 
@@ -561,18 +609,30 @@
         const input = targetInput || findRelatedInput(captchaInfo.element);
         if (input) {
           console.log('[Captcha Auto-Fill] 找到输入框，准备填写:', cleanText);
-          const filled = fillCaptchaInput(cleanText, input);
+          // 关键修复：等待填写完成并验证
+          const filled = await fillCaptchaInput(cleanText, input);
           console.log('[Captcha Auto-Fill] 填写结果:', filled ? '成功' : '失败');
+
+          if (!filled) {
+            showNotification('验证码填写失败', 'error');
+            return;
+          }
 
           // 显示成功通知
           showNotification(`验证码已识别: ${cleanText}`, 'success');
 
-          // 如果一键登录已启用，自动点击登录按钮
-          if (oneClickLoginEnabled && !isOneClickLoginMode) {
+          // 如果开启了一键登录，自动点击登录按钮
+          // 重新读取设置以确保最新状态
+          const currentSettings = await chrome.storage.sync.get('oneClickLogin');
+          const shouldAutoLogin = currentSettings.oneClickLogin === true;
+          console.log('[Captcha Auto-Fill] 一键登录状态:', { cached: oneClickLoginEnabled, current: shouldAutoLogin });
+
+          if (shouldAutoLogin) {
             console.log('[Captcha Auto-Fill] 一键登录已启用，准备自动提交');
-            setTimeout(() => {
-              autoClickLoginButton();
-            }, 500);
+            await new Promise(resolve => setTimeout(resolve, 500));
+            await autoClickLoginButton();
+          } else {
+            console.log('[Captcha Auto-Fill] 验证码已填写，请手动点击登录按钮');
           }
         } else {
           console.warn('[Captcha Auto-Fill] 未找到验证码输入框');
@@ -604,7 +664,7 @@
             if (captchas.length > 0) {
               processCaptcha(captchas[0], targetInput);
             }
-          }, 1500);
+          }, 1000);
         }
       }
     } catch (error) {
@@ -619,7 +679,7 @@
           if (captchas.length > 0) {
             processCaptcha(captchas[0], targetInput);
           }
-        }, 1500);
+        }, 1000);
       }
     } finally {
       isProcessing = false;
@@ -629,7 +689,7 @@
   /**
    * 获取图片数据
    * 直接从已加载的 img 元素提取（避免重新 fetch 导致验证码刷新）
-   * 修复：处理 src 为空的情况，添加重试机制
+   * 修复：处理 src 为空的情况，添加重试机制，确保获取最新图片
    */
   async function getImageData(imgElement) {
     // 检查图片 src 是否有效
@@ -640,7 +700,7 @@
       triggerCaptchaRefresh();
 
       // 等待图片加载
-      await new Promise(resolve => setTimeout(resolve, 800));
+      await new Promise(resolve => setTimeout(resolve, 600));
 
       // 重新检查 src
       if (!imgElement.src ||
@@ -656,7 +716,7 @@
       await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
           reject(new Error('图片加载超时'));
-        }, 5000);
+        }, 3000);
 
         imgElement.onload = () => {
           clearTimeout(timeout);
@@ -675,7 +735,7 @@
     if (width === 64 && height === 64) {
       console.log('[Captcha Auto-Fill] 检测到 64x64 占位图标，尝试刷新');
       triggerCaptchaRefresh();
-      await new Promise(resolve => setTimeout(resolve, 800));
+      await new Promise(resolve => setTimeout(resolve, 600));
 
       // 重新检查尺寸
       const newWidth = imgElement.naturalWidth || imgElement.width;
@@ -686,14 +746,15 @@
     }
 
     try {
-      // 等待图片完全加载完成（关键修复：点击刷新后图片可能正在加载中）
+      // 关键修复：强制等待以确保获取最新图片
+      // 在验证码刷新后，即使 img.complete 为 true，也可能需要额外时间让浏览器渲染新图片
       if (!imgElement.complete || imgElement.naturalWidth === 0) {
         console.log('[Captcha Auto-Fill] 图片正在加载中，等待加载完成...');
         await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => {
             console.warn('[Captcha Auto-Fill] 等待图片加载超时');
             resolve(); // 超时后继续尝试
-          }, 3000);
+          }, 2000);
 
           const cleanup = () => {
             clearTimeout(timeout);
@@ -722,7 +783,7 @@
 
       // 直接从 img 元素绘制到 canvas，获取当前显示的图片数据
       // 这样可以确保获取的是页面上实际显示的验证码，而不是重新请求的新验证码
-      console.log('[Captcha Auto-Fill] 从 img 元素提取图片数据');
+      console.log('[Captcha Auto-Fill] 从 img 元素提取图片数据，当前 src:', imgElement.src.substring(imgElement.src.lastIndexOf('/') + 1));
 
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
@@ -730,6 +791,9 @@
       // 设置 canvas 尺寸为图片原始尺寸
       canvas.width = imgElement.naturalWidth || imgElement.width;
       canvas.height = imgElement.naturalHeight || imgElement.height;
+
+      // 关键修复：清除 canvas 以确保不会保留旧数据
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
 
       // 绘制图片
       ctx.drawImage(imgElement, 0, 0);
@@ -764,33 +828,11 @@
 
       return base64;
     } catch (error) {
-      console.warn('[Captcha Auto-Fill] 从 img 提取失败，尝试 fetch:', error.message);
-
-      // 备选：使用 fetch（可能会获取到新的验证码）
-      try {
-        const imageUrl = imgElement.src;
-        const response = await fetch(imageUrl, {
-          method: 'GET',
-          credentials: 'include',
-          headers: {
-            'Accept': 'image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-          }
-        });
-
-        if (!response.ok) {
-          throw new Error(`Fetch 图片失败: HTTP ${response.status}`);
-        }
-
-        const blob = await response.blob();
-        const base64 = await blobToBase64(blob);
-        console.log('[Captcha Auto-Fill] fetch 成功，base64 长度:', base64.length);
-        return base64;
-      } catch (fetchError) {
-        console.error('[Captcha Auto-Fill] 获取图片数据失败:', fetchError);
-        // 返回原始 URL 作为最后备选
-        return imgElement.src;
-      }
+      // 关键修复：不再使用 fetch 作为 fallback，因为 fetch 会导致验证码刷新
+      // 如果 canvas 提取失败，直接抛出错误，让上层处理
+      console.error('[Captcha Auto-Fill] 从 img 提取失败:', error.message);
+      console.warn('[Captcha Auto-Fill] 注意：使用 fetch 获取验证码图片会导致验证码刷新，因此禁用此 fallback');
+      throw new Error(`获取验证码图片失败: ${error.message}`);
     }
   }
 
@@ -919,8 +961,9 @@
   /**
    * 填写验证码到输入框
    * 增强版本，支持 React/Vue/Angular 等现代框架
+   * 修复：返回 Promise，确保验证完成后再继续
    */
-  function fillCaptchaInput(text, inputElement = null) {
+  async function fillCaptchaInput(text, inputElement = null) {
     const input = inputElement || findRelatedInput(document.querySelector('img[src*="captcha"]'));
 
     if (!input) {
@@ -1001,21 +1044,46 @@
     // 失去焦点
     input.blur();
 
-    // 验证是否填写成功
-    setTimeout(() => {
-      if (input.value === text) {
-        console.log('[Captcha Auto-Fill] 验证成功，验证码已填写:', input.value);
-      } else {
-        console.warn('[Captcha Auto-Fill] 验证失败，期望:', text, '实际:', input.value);
-        // 重试：直接设置值
-        input.value = text;
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-    }, 100);
-
     console.log('[Captcha Auto-Fill] 已填写验证码:', text);
-    return true;
+
+    // 等待验证完成
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    // 对于 jaccount，使用 jQuery 设置值（如果页面使用了 jQuery）
+    // 注意：必须使用精确的选择器 #input-login-captcha，避免选中短信验证码框
+    if (window.location.href.includes('jaccount.sjtu.edu.cn') && typeof window.jQuery !== 'undefined') {
+      const $ = window.jQuery;
+      // 使用精确ID选择器，避免选中其他captcha输入框
+      const jqueryVal = $('#input-login-captcha').val();
+      if (jqueryVal !== text) {
+        console.log('[Captcha Auto-Fill] jQuery val 不同步，使用 jQuery 设置值:', jqueryVal, '->', text);
+        $('#input-login-captcha').val(text).trigger('input').trigger('change');
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
+    }
+
+    // 验证是否填写成功
+    if (input.value === text) {
+      console.log('[Captcha Auto-Fill] 验证成功，验证码已填写:', input.value);
+      return true;
+    } else {
+      console.warn('[Captcha Auto-Fill] 验证失败，期望:', text, '实际:', input.value);
+      // 重试：直接设置值
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+
+      // 再次等待验证
+      await new Promise(resolve => setTimeout(resolve, 150));
+
+      if (input.value === text) {
+        console.log('[Captcha Auto-Fill] 重试后验证成功');
+        return true;
+      } else {
+        console.error('[Captcha Auto-Fill] 重试后仍然失败');
+        return false;
+      }
+    }
   }
 
   /**
@@ -1081,18 +1149,177 @@
         // 处理得分最高的验证码
         processCaptcha(captchas[0]);
       }
-    }, 1500);
+    }, 1000);
+  }
+
+  /**
+   * 自动填充用户名和密码
+   * 在验证码识别之前调用，确保表单完整填写
+   */
+  async function fillCredentials() {
+    // 检查是否启用了自动填充且有保存的账号密码
+    console.log('[Captcha Auto-Fill] fillCredentials 被调用:', {
+      autoFillCredentials,
+      hasUser: !!jaccountUser,
+      hasPass: !!jaccountPass,
+      userLength: jaccountUser?.length,
+      passLength: jaccountPass?.length
+    });
+
+    if (!autoFillCredentials) {
+      console.log('[Captcha Auto-Fill] 自动填充未启用');
+      return false;
+    }
+
+    if (!jaccountUser || !jaccountPass) {
+      console.log('[Captcha Auto-Fill] 账号密码未设置');
+      return false;
+    }
+
+    // 防止重复填充
+    if (credentialsFilled) {
+      console.log('[Captcha Auto-Fill] 账号密码已经填充过，跳过');
+      return true;
+    }
+
+    console.log('[Captcha Auto-Fill] 开始自动填充账号密码');
+
+    // 查找用户名和密码输入框
+    const userInput = document.getElementById('input-login-user');
+    const passInput = document.getElementById('input-login-pass');
+
+    if (!userInput || !passInput) {
+      console.warn('[Captcha Auto-Fill] 未找到用户名或密码输入框');
+      return false;
+    }
+
+    // 检查输入框是否已经有值（可能是浏览器自动填充的）
+    const existingUser = userInput.value;
+    const existingPass = passInput.value;
+    console.log('[Captcha Auto-Fill] 输入框当前值:', {
+      user: existingUser || '空',
+      pass: existingPass ? '有值' : '空'
+    });
+
+    try {
+      // 只在输入框为空时填充
+      if (!existingUser) {
+        await fillInputValue(userInput, jaccountUser);
+        console.log('[Captcha Auto-Fill] 用户名已填充');
+      } else {
+        console.log('[Captcha Auto-Fill] 用户名已有值，跳过填充');
+      }
+
+      if (!existingPass) {
+        await fillInputValue(passInput, jaccountPass);
+        console.log('[Captcha Auto-Fill] 密码已填充');
+      } else {
+        console.log('[Captcha Auto-Fill] 密码已有值，跳过填充');
+      }
+
+      credentialsFilled = true;
+      showNotification('账号密码已自动填充', 'info');
+      return true;
+    } catch (error) {
+      console.error('[Captcha Auto-Fill] 填充账号密码失败:', error);
+      return false;
+    }
+  }
+
+  /**
+   * 通用输入框填充函数
+   * 支持 React/Vue/Angular 等现代框架
+   */
+  async function fillInputValue(input, value) {
+    // 滚动到输入框可见
+    input.scrollIntoView({ behavior: 'instant', block: 'center' });
+
+    // 聚焦输入框
+    input.focus();
+    input.click();
+
+    // 清空输入框
+    input.value = '';
+
+    // 获取原生 value 属性描述符，绕过 React/Vue 等框架的拦截
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+
+    // 对于 React，需要先设置 _valueTracker
+    const tracker = input._valueTracker;
+    if (tracker) {
+      tracker.setValue('');
+    }
+
+    // 设置值
+    nativeInputValueSetter.call(input, value);
+
+    // 对于 React
+    if (tracker) {
+      tracker.setValue(value);
+    }
+
+    // 触发 input 事件
+    input.dispatchEvent(new InputEvent('input', {
+      bubbles: true,
+      cancelable: true,
+      inputType: 'insertText',
+      data: value
+    }));
+
+    // 触发 change 事件
+    input.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+
+    // 对于 Vue.js，触发 compositionend 事件
+    input.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
+
+    // 失去焦点
+    input.blur();
+
+    // 等待一小段时间确保值已设置
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    // 验证是否填写成功
+    if (input.value !== value) {
+      // 重试：直接设置值
+      input.value = value;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    return input.value === value;
   }
 
   /**
    * 专门处理 jaccount 验证码
-   * 修复：排除 64x64 图标，处理 src 为空的情况
+   * 修复：排除 64x64 图标，处理 src 为空的情况，确保使用最新图片
    */
   async function handleJaccountCaptcha() {
     console.log('[Captcha Auto-Fill] 处理 jaccount 验证码');
 
+    // 首先尝试从 storage 重新读取账号设置（确保最新）
+    try {
+      const settings = await chrome.storage.sync.get(['autoFillCredentials', 'jaccountUser', 'jaccountPass', 'oneClickLogin']);
+      autoFillCredentials = settings.autoFillCredentials === true;
+      jaccountUser = settings.jaccountUser || '';
+      jaccountPass = settings.jaccountPass || '';
+      oneClickLoginEnabled = settings.oneClickLogin === true;
+      console.log('[Captcha Auto-Fill] 重新读取账号设置:', {
+        autoFillCredentials,
+        hasUser: !!jaccountUser,
+        hasPass: !!jaccountPass,
+        oneClickLoginEnabled
+      });
+    } catch (e) {
+      console.warn('[Captcha Auto-Fill] 读取设置失败:', e);
+    }
+
+    // 首先尝试自动填充账号密码
+    await fillCredentials();
+
     // jaccount 验证码图片选择器 - 直接选择 img#captcha-img
-    const captchaImg = document.querySelector('img#captcha-img');
+    // 关键修复：每次重新查询 DOM，确保获取最新的 img 元素
+    let captchaImg = document.querySelector('img#captcha-img');
 
     if (!captchaImg) {
       console.log('[Captcha Auto-Fill] 未找到 jaccount 验证码图片');
@@ -1100,14 +1327,14 @@
     }
 
     // 检查是否是 64x64 占位图标
-    const width = captchaImg.naturalWidth || captchaImg.width;
-    const height = captchaImg.naturalHeight || captchaImg.height;
+    let width = captchaImg.naturalWidth || captchaImg.width;
+    let height = captchaImg.naturalHeight || captchaImg.height;
 
     if (width === 64 && height === 64) {
       console.log('[Captcha Auto-Fill] 检测到 64x64 占位图标，尝试刷新验证码');
       triggerCaptchaRefresh();
       // 延迟后重试
-      setTimeout(() => handleJaccountCaptcha(), 1000);
+      setTimeout(() => handleJaccountCaptcha(), 800);
       return;
     }
 
@@ -1117,11 +1344,11 @@
         captchaImg.src.includes('image/captcha.png')) {
       console.log('[Captcha Auto-Fill] 验证码图片 src 无效，尝试刷新');
       triggerCaptchaRefresh();
-      setTimeout(() => handleJaccountCaptcha(), 1000);
+      setTimeout(() => handleJaccountCaptcha(), 800);
       return;
     }
 
-    console.log('[Captcha Auto-Fill] 找到 jaccount 验证码图片:', captchaImg.src);
+    console.log('[Captcha Auto-Fill] 找到 jaccount 验证码图片:', captchaImg.src.substring(captchaImg.src.lastIndexOf('/') + 1));
 
     // 使用增强的查找逻辑找到验证码输入框
     const captchaInput = findRelatedInput(captchaImg);
@@ -1141,7 +1368,7 @@
         const timeout = setTimeout(() => {
           console.warn('[Captcha Auto-Fill] 图片加载超时');
           resolve();
-        }, 5000);
+        }, 3000);
 
         captchaImg.onload = () => {
           clearTimeout(timeout);
@@ -1155,6 +1382,14 @@
       });
     }
 
+    // 关键修复：在 processCaptcha 前重新查询 DOM，确保使用最新的 img 元素
+    // 这是为了防止在等待期间图片已经被刷新
+    captchaImg = document.querySelector('img#captcha-img');
+    if (!captchaImg) {
+      console.warn('[Captcha Auto-Fill] 重新查询后未找到验证码图片');
+      return;
+    }
+
     // 再次检查尺寸
     const finalWidth = captchaImg.naturalWidth || captchaImg.width;
     const finalHeight = captchaImg.naturalHeight || captchaImg.height;
@@ -1162,6 +1397,8 @@
       console.warn('[Captcha Auto-Fill] 加载完成后仍是 64x64 图标，跳过处理');
       return;
     }
+
+    console.log('[Captcha Auto-Fill] 最终使用验证码图片:', captchaImg.src.substring(captchaImg.src.lastIndexOf('/') + 1));
 
     await processCaptcha({
       element: captchaImg,
@@ -1200,7 +1437,7 @@
           if (captchas.length > 0) {
             processCaptcha(captchas[0]);
           }
-        }, 500);
+        }, 300);
       }
     });
 
@@ -1221,14 +1458,15 @@
    * 一键登录处理
    * 1. 识别并填写验证码
    * 2. 点击登录按钮
-   * 3. 监听登录结果，失败则自动重试
+   * 3. 登录失败时自动重试，最多重试 MAX_LOGIN_RETRIES 次
    */
   async function handleOneClickLogin() {
     console.log('[Captcha Auto-Fill] 开始一键登录');
     showNotification('开始一键登录...', 'info');
 
-    isOneClickLoginMode = true;
+    // 重置重试计数器（新的一次性登录流程）
     loginRetryCount = 0;
+    isOneClickLoginMode = true;
 
     // 先确保验证码已识别
     if (!recognizedCaptcha || !recognizedCaptcha.text) {
@@ -1243,8 +1481,8 @@
 
     // 等待识别完成
     let waitCount = 0;
-    while ((!recognizedCaptcha || !recognizedCaptcha.text) && waitCount < 10) {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    while ((!recognizedCaptcha || !recognizedCaptcha.text) && waitCount < 15) {
+      await new Promise(resolve => setTimeout(resolve, 300));
       waitCount++;
     }
 
@@ -1262,7 +1500,7 @@
       return { success: false, message: '未找到登录按钮' };
     }
 
-    // 开始监听登录失败
+    // 开始监听登录结果（失败时自动重试）
     startLoginFailureMonitor();
 
     // 点击登录按钮
@@ -1279,8 +1517,37 @@
   function findLoginButton() {
     // jaccount 特定选择器
     if (window.location.href.includes('jaccount.sjtu.edu.cn')) {
-      const jaccountBtn = document.querySelector('button#login-button, button[type="submit"], .login-btn, button.btn-primary');
-      if (jaccountBtn) return jaccountBtn;
+      console.log('[Captcha Auto-Fill] 开始查找 jaccount 登录按钮');
+
+      // 关键修复：优先精确查找密码登录按钮
+      const passwordBtn = document.querySelector('#submit-password-button');
+      if (passwordBtn) {
+        console.log('[Captcha Auto-Fill] 找到密码登录按钮:', passwordBtn.id);
+        return passwordBtn;
+      }
+
+      // 如果没找到，尝试查找其他可能的登录按钮（排除短信验证码按钮）
+      const possibleBtns = document.querySelectorAll('input[type="submit"], button[type="submit"]');
+      console.log('[Captcha Auto-Fill] 找到', possibleBtns.length, '个可能的提交按钮');
+
+      for (const btn of possibleBtns) {
+        // 排除短信验证码按钮
+        if (btn.id && (btn.id.includes('sms') || btn.id.includes('SMS'))) {
+          console.log('[Captcha Auto-Fill] 跳过短信按钮:', btn.id);
+          continue;
+        }
+
+        // 检查按钮是否在密码登录表单中（通过检查父元素或相邻元素）
+        const form = btn.closest('form');
+        const hasPasswordField = form && form.querySelector('input[type="password"]');
+
+        if (hasPasswordField) {
+          console.log('[Captcha Auto-Fill] 找到密码表单中的登录按钮:', btn.id || btn.className);
+          return btn;
+        }
+      }
+
+      console.warn('[Captcha Auto-Fill] 未找到 jaccount 登录按钮');
     }
 
     // 通用登录按钮检测
@@ -1316,10 +1583,21 @@
   }
 
   /**
-   * 启动登录失败监听器
+   * 启动登录结果监听器
+   * 登录失败时自动重试，最多重试 MAX_LOGIN_RETRIES 次
    */
   function startLoginFailureMonitor() {
-    console.log('[Captcha Auto-Fill] 启动登录失败监听');
+    console.log('[Captcha Auto-Fill] 启动登录失败监听，当前重试次数:', loginRetryCount);
+
+    // 记录初始错误状态，避免检测到点击前就已存在的错误
+    const initialErrorInfo = detectLoginError();
+    const hadInitialError = initialErrorInfo.hasError;
+    if (hadInitialError) {
+      console.log('[Captcha Auto-Fill] 检测到页面已有错误提示，将忽略:', initialErrorInfo.message);
+    }
+
+    let lastErrorMessage = hadInitialError ? initialErrorInfo.message : null;
+    let retryScheduled = false;  // 防止重复调度重试
 
     // 使用 MutationObserver 监听页面变化
     const observer = new MutationObserver((mutations) => {
@@ -1330,10 +1608,44 @@
 
       // 检查是否有错误提示
       const errorInfo = detectLoginError();
-      if (errorInfo.hasError && errorInfo.isCaptchaError) {
-        console.log('[Captcha Auto-Fill] 检测到验证码错误，准备重试');
+      if (errorInfo.hasError) {
+        // 关键修复：如果错误信息与之前相同，说明不是新错误，忽略
+        if (errorInfo.message === lastErrorMessage) {
+          console.log('[Captcha Auto-Fill] 忽略重复的错误提示:', errorInfo.message);
+          return;
+        }
+
+        // 更新最后错误消息
+        lastErrorMessage = errorInfo.message;
+
+        console.log('[Captcha Auto-Fill] 检测到登录错误:', errorInfo.message);
+        console.log('[Captcha Auto-Fill] 是否是验证码错误:', errorInfo.isCaptchaError);
+        console.log('[Captcha Auto-Fill] 当前重试次数:', loginRetryCount, '最大重试次数:', MAX_LOGIN_RETRIES);
+
+        // 停止当前监听
         observer.disconnect();
-        handleLoginRetry();
+        isOneClickLoginMode = false;
+        autoLoginTriggered = false;
+
+        // 检查是否需要重试
+        if (loginRetryCount < MAX_LOGIN_RETRIES) {
+          if (!retryScheduled) {
+            retryScheduled = true;
+            loginRetryCount++;
+            console.log(`[Captcha Auto-Fill] 登录失败，准备第 ${loginRetryCount} 次重试...`);
+            showNotification(`登录失败，正在第 ${loginRetryCount} 次重试...`, 'warning');
+
+            // 延迟后重试
+            setTimeout(async () => {
+              await retryLogin();
+            }, 800);
+          }
+        } else {
+          console.log('[Captcha Auto-Fill] 已达到最大重试次数，停止自动重试');
+          showNotification('登录失败次数过多，请手动检查账号密码', 'error');
+          // 重置重试计数器，允许下次手动触发
+          loginRetryCount = 0;
+        }
       }
     });
 
@@ -1343,91 +1655,38 @@
       characterData: true
     });
 
-    // 5秒后自动停止监听（避免长期监听）
+    // 5秒后自动停止监听
     setTimeout(() => {
       if (isOneClickLoginMode) {
         observer.disconnect();
         isOneClickLoginMode = false;
-        console.log('[Captcha Auto-Fill] 登录监听超时结束');
+        autoLoginTriggered = false;
+        // 登录成功或超时，重置重试计数器
+        loginRetryCount = 0;
+        console.log('[Captcha Auto-Fill] 登录监听超时结束，重置重试计数器');
       }
     }, 5000);
   }
 
   /**
-   * 检测登录错误
+   * 重试登录
+   * 刷新验证码并重新识别、填写、提交
    */
-  function detectLoginError() {
-    const result = { hasError: false, isCaptchaError: false, message: '' };
+  async function retryLogin() {
+    console.log('[Captcha Auto-Fill] 开始重试登录流程');
 
-    // 检查常见的错误提示元素
-    const errorSelectors = [
-      '.error-message', '.error', '.alert-error', '.alert-danger',
-      '.tips--danger', '.tips', '.el-message__content',
-      '[class*="error"]', '[class*="danger"]'
-    ];
-
-    for (const selector of errorSelectors) {
-      const elements = document.querySelectorAll(selector);
-      for (const el of elements) {
-        const text = (el.textContent || '').toLowerCase();
-        if (text && text.length > 0) {
-          result.hasError = true;
-          result.message = text;
-
-          // 判断是否是验证码错误
-          if (text.includes('验证码') ||
-              text.includes('captcha') ||
-              text.includes('verification') ||
-              text.includes('验证')) {
-            result.isCaptchaError = true;
-          }
-
-          return result;
-        }
-      }
-    }
-
-    // jaccount 特定错误检测
-    if (window.location.href.includes('jaccount.sjtu.edu.cn')) {
-      // 检查是否有错误提示
-      const allText = document.body.textContent.toLowerCase();
-      if (allText.includes('验证码错误') ||
-          allText.includes('验证码不正确') ||
-          allText.includes('captcha error')) {
-        result.hasError = true;
-        result.isCaptchaError = true;
-        result.message = '验证码错误';
-        return result;
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * 处理登录重试
-   */
-  async function handleLoginRetry() {
-    if (loginRetryCount >= MAX_RETRY_COUNT) {
-      isOneClickLoginMode = false;
-      showNotification('已达到最大重试次数，请手动检查', 'error');
-      return;
-    }
-
-    loginRetryCount++;
-    console.log(`[Captcha Auto-Fill] 第 ${loginRetryCount} 次重试`);
-    showNotification(`验证码错误，正在第 ${loginRetryCount} 次重试...`, 'info');
-
-    // 清除之前的识别结果
+    // 重置状态
     recognizedCaptcha = null;
+    isProcessing = false;
 
     // 刷新验证码
     triggerCaptchaRefresh();
+    showNotification('正在刷新验证码...', 'info');
 
     // 等待验证码刷新
-    await new Promise(resolve => setTimeout(resolve, 1500));
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
-    // 重新识别
+    // 重新检测并识别验证码
     if (window.location.href.includes('jaccount.sjtu.edu.cn')) {
       await handleJaccountCaptcha();
     } else {
@@ -1439,22 +1698,90 @@
 
     // 等待识别完成
     let waitCount = 0;
-    while ((!recognizedCaptcha || !recognizedCaptcha.text) && waitCount < 10) {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    while ((!recognizedCaptcha || !recognizedCaptcha.text) && waitCount < 15) {
+      await new Promise(resolve => setTimeout(resolve, 300));
       waitCount++;
     }
 
-    if (recognizedCaptcha && recognizedCaptcha.text) {
-      // 重新点击登录
-      const loginBtn = findLoginButton();
-      if (loginBtn) {
-        startLoginFailureMonitor();
-        loginBtn.click();
-      }
-    } else {
-      isOneClickLoginMode = false;
-      showNotification('重试识别失败', 'error');
+    if (!recognizedCaptcha || !recognizedCaptcha.text) {
+      console.warn('[Captcha Auto-Fill] 重试时验证码识别失败');
+      showNotification('验证码识别失败，请手动刷新', 'error');
+      return;
     }
+
+    console.log('[Captcha Auto-Fill] 重试时验证码识别成功:', recognizedCaptcha.text);
+
+    // 重新点击登录按钮
+    await autoClickLoginButton();
+  }
+
+  /**
+   * 检测登录错误
+   */
+  function detectLoginError() {
+    const result = { hasError: false, isCaptchaError: false, message: '' };
+
+    // jaccount 特定错误检测 - 优先使用精确的选择器
+    if (window.location.href.includes('jaccount.sjtu.edu.cn')) {
+      // jaccount 使用 #div_warn 显示错误，检查它是否可见且有内容
+      const warnDiv = document.getElementById('div_warn');
+      if (warnDiv) {
+        const style = window.getComputedStyle(warnDiv);
+        const isVisible = style.display !== 'none' && style.visibility !== 'hidden';
+        const warnSpan = document.getElementById('span_warn');
+        const text = (warnSpan ? warnSpan.textContent : warnDiv.textContent) || '';
+
+        if (isVisible && text.trim().length > 0) {
+          result.hasError = true;
+          result.message = text.toLowerCase();
+
+          // 判断是否是验证码错误
+          if (result.message.includes('验证码') ||
+              result.message.includes('captcha')) {
+            result.isCaptchaError = true;
+          }
+
+          return result;
+        }
+      }
+    }
+
+    // 通用错误检测 - 只检查明确显示的错误提示
+    const errorSelectors = [
+      '.error-message:not(:empty)',
+      '.alert-error:not(:empty)',
+      '.alert-danger:not(:empty)',
+      '.tips--danger:not(:empty)',
+      '.el-message--error:not(:empty)'
+    ];
+
+    for (const selector of errorSelectors) {
+      const elements = document.querySelectorAll(selector);
+      for (const el of elements) {
+        const style = window.getComputedStyle(el);
+        const isVisible = style.display !== 'none' && style.visibility !== 'hidden';
+        const text = (el.textContent || '').trim();
+
+        // 只处理可见且有文本的元素
+        if (isVisible && text.length > 0) {
+          const lowerText = text.toLowerCase();
+          result.hasError = true;
+          result.message = lowerText;
+
+          // 判断是否是验证码错误
+          if (lowerText.includes('验证码') ||
+              lowerText.includes('captcha') ||
+              lowerText.includes('verification') ||
+              lowerText.includes('验证')) {
+            result.isCaptchaError = true;
+          }
+
+          return result;
+        }
+      }
+    }
+
+    return result;
   }
 
   /**
@@ -1469,20 +1796,319 @@
       return;
     }
 
-    // 设置一键登录模式标志
+    // 输出按钮详细信息用于调试
+    console.log('[Captcha Auto-Fill] 登录按钮详情:', {
+      id: loginBtn.id,
+      type: loginBtn.type,
+      tagName: loginBtn.tagName,
+      className: loginBtn.className,
+      value: loginBtn.value,
+      disabled: loginBtn.disabled,
+      visible: loginBtn.offsetParent !== null
+    });
+
+    // 检查按钮是否可见和可用
+    if (loginBtn.disabled) {
+      console.warn('[Captcha Auto-Fill] 登录按钮被禁用');
+      return;
+    }
+
+    if (loginBtn.offsetParent === null) {
+      console.warn('[Captcha Auto-Fill] 登录按钮不可见（可能在隐藏的元素中）');
+      // 尝试滚动到按钮位置
+      loginBtn.scrollIntoView({ behavior: 'instant', block: 'center' });
+      console.log('[Captcha Auto-Fill] 已滚动到按钮位置');
+    }
+
+    // 设置一键登录模式标志，重置重试计数器
     isOneClickLoginMode = true;
     loginRetryCount = 0;
 
-    // 启动失败监听
+    showNotification('正在自动登录...', 'info');
+
+    // 关键修复：重新读取账号设置，确保有最新的凭据
+    if (window.location.href.includes('jaccount.sjtu.edu.cn')) {
+      try {
+        const settings = await chrome.storage.sync.get(['autoFillCredentials', 'jaccountUser', 'jaccountPass']);
+        autoFillCredentials = settings.autoFillCredentials === true;
+        jaccountUser = settings.jaccountUser || '';
+        jaccountPass = settings.jaccountPass || '';
+        console.log('[Captcha Auto-Fill] 登录前重新读取账号设置:', {
+          autoFillCredentials,
+          hasUser: !!jaccountUser,
+          hasPass: !!jaccountPass
+        });
+      } catch (e) {
+        console.warn('[Captcha Auto-Fill] 读取设置失败:', e);
+      }
+    }
+
+    // 关键修复：对于 jaccount，等待操作按钮区域显示
+    if (window.location.href.includes('jaccount.sjtu.edu.cn')) {
+      const operateButtons = document.getElementById('operate-buttons');
+      if (operateButtons) {
+        const style = window.getComputedStyle(operateButtons);
+        if (style.display === 'none') {
+          console.log('[Captcha Auto-Fill] 等待操作按钮区域显示...');
+          // 等待最多 1 秒
+          let waitCount = 0;
+          while (style.display === 'none' && waitCount < 10) {
+            await new Promise(resolve => setTimeout(resolve, 100));
+            waitCount++;
+          }
+          console.log('[Captcha Auto-Fill] 操作按钮区域已显示或超时');
+        }
+      }
+    }
+
+    // 延迟点击，确保验证码完全同步到表单
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // 启动失败监听（在点击前启动，确保能捕获错误）
     startLoginFailureMonitor();
 
+    // 短暂延迟，让监听器先准备好
+    await new Promise(resolve => setTimeout(resolve, 100));
+
     // 点击登录按钮
-    showNotification('正在自动登录...', 'info');
-    loginBtn.click();
+    console.log('[Captcha Auto-Fill] 执行点击登录按钮');
+
+    // 尝试多种点击方式，确保触发登录
+    try {
+      // 对于 jaccount，优先直接调用 checkForm 函数
+      const isJaccount = window.location.href.includes('jaccount.sjtu.edu.cn');
+      console.log('[Captcha Auto-Fill] 是否是 jaccount 页面:', isJaccount, 'URL:', window.location.href);
+
+      if (isJaccount) {
+        // 关键修复：设置 captchaCheckStatus 为 'passed'，避免 checkForm 中的验证拦截
+        if (typeof window.captchaCheckStatus !== 'undefined') {
+          console.log('[Captcha Auto-Fill] 设置 captchaCheckStatus 为 passed');
+          window.captchaCheckStatus = 'passed';
+        }
+
+        console.log('[Captcha Auto-Fill] checkForm 类型:', typeof window.checkForm);
+
+        // 关键修复：直接构造并提交表单数据，绕过 checkForm
+        console.log('[Captcha Auto-Fill] 使用 AJAX 直接提交登录请求');
+
+        // 等待浏览器自动填充完成
+        console.log('[Captcha Auto-Fill] 等待浏览器自动填充...');
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        // 获取表单数据 - 优先使用 jQuery（因为页面使用了 jQuery）
+        let user = '', password = '', captcha = '';
+
+        // 辅助函数：读取表单数据
+        const readFormData = () => {
+          // 直接使用原生 DOM API 读取，避免 jQuery 可能的选择器问题
+          const userInput = document.getElementById('input-login-user');
+          const passInput = document.getElementById('input-login-pass');
+          const captchaInput = document.getElementById('input-login-captcha');
+
+          // 优先使用原生 value 属性
+          user = userInput?.value || '';
+          password = passInput?.value || '';
+          captcha = captchaInput?.value || '';
+
+          // 如果原生值为空，尝试使用 jQuery（页面可能使用了 jQuery 的 val() 方法）
+          if ((!user || !password || !captcha) && typeof window.jQuery !== 'undefined') {
+            const $ = window.jQuery;
+            if (!user) user = $('#input-login-user').val() || '';
+            if (!password) password = $('#input-login-pass').val() || '';
+            if (!captcha) captcha = $('#input-login-captcha').val() || '';
+          }
+
+          console.log('[Captcha Auto-Fill] 读取到的原始值:', {
+            user: user || '空',
+            pass: password ? '有值' : '空',
+            captcha: captcha || '空'
+          });
+        };
+
+        readFormData();
+        console.log('[Captcha Auto-Fill] 首次读取表单数据:', { user: user || '未填写', password: password ? '已填写' : '未填写', captcha: captcha || '空' });
+
+        // 如果用户名或密码为空，尝试使用保存的凭据填充
+        if (!user || !password) {
+          console.log('[Captcha Auto-Fill] 表单为空，检查保存的凭据:', {
+            hasSavedUser: !!jaccountUser,
+            hasSavedPass: !!jaccountPass
+          });
+
+          if (jaccountUser && jaccountPass) {
+            console.log('[Captcha Auto-Fill] 尝试使用保存的凭据填充');
+            const filled = await fillCredentials();
+            console.log('[Captcha Auto-Fill] 凭据填充结果:', filled);
+
+            // 重新读取表单数据
+            await new Promise(resolve => setTimeout(resolve, 300));
+            readFormData();
+            console.log('[Captcha Auto-Fill] 填充后读取表单数据:', { user: user || '未填写', password: password ? '已填写' : '未填写', captcha: captcha || '空' });
+          } else {
+            console.log('[Captcha Auto-Fill] 没有保存的凭据可用');
+          }
+        } else {
+          console.log('[Captcha Auto-Fill] 表单已有数据，跳过填充');
+        }
+
+        // 关键：确保验证码已正确读取
+        if (!captcha) {
+          console.warn('[Captcha Auto-Fill] 验证码为空，尝试重新读取');
+          readFormData();
+          console.log('[Captcha Auto-Fill] 重新读取后验证码:', captcha || '仍为空');
+        }
+
+        console.log('[Captcha Auto-Fill] 最终表单数据:', { user: user || '未填写', password: password ? '已填写' : '未填写', captcha: captcha || '空', captchaLength: captcha?.length });
+
+        if (!user || !password) {
+          console.warn('[Captcha Auto-Fill] 用户名或密码未填写，无法自动登录');
+          showNotification('请先填写用户名和密码', 'error');
+          return;
+        }
+
+        // 构造登录参数
+        const params = new URLSearchParams(window.location.search);
+        const loginData = {
+          sid: params.get('sid') || 'jasjtumail',
+          client: '',
+          returl: params.get('returl') || '',
+          se: params.get('se') || '',
+          v: '',
+          uuid: document.querySelector('input[name="uuid"]')?.value || '',
+          user: user,
+          pass: password,
+          captcha: captcha,
+          lt: 'p'
+        };
+
+        console.log('[Captcha Auto-Fill] 准备提交登录请求，数据:', { ...loginData, pass: '***隐藏***' });
+
+        // 方案1：尝试直接点击登录按钮（模拟用户点击）
+        console.log('[Captcha Auto-Fill] 尝试方案1：直接点击登录按钮');
+        const passwordBtn = document.getElementById('submit-password-button');
+        console.log('[Captcha Auto-Fill] 登录按钮状态:', {
+          found: !!passwordBtn,
+          disabled: passwordBtn?.disabled,
+          visible: passwordBtn?.offsetParent !== null
+        });
+
+        if (passwordBtn && !passwordBtn.disabled) {
+          // 设置 captchaCheckStatus 为 passed，避免 checkForm 拦截
+          if (typeof window.captchaCheckStatus !== 'undefined') {
+            window.captchaCheckStatus = 'passed';
+            console.log('[Captcha Auto-Fill] 已设置 captchaCheckStatus = passed');
+          }
+
+          // 滚动到按钮位置并聚焦
+          passwordBtn.scrollIntoView({ behavior: 'instant', block: 'center' });
+          passwordBtn.focus();
+
+          // 触发点击
+          console.log('[Captcha Auto-Fill] 即将点击登录按钮...');
+          passwordBtn.click();
+          console.log('[Captcha Auto-Fill] 已点击登录按钮');
+
+          // 等待页面跳转或错误提示
+          setTimeout(() => {
+            // 检查是否还在登录页面（说明可能登录失败）
+            if (window.location.href.includes('jaccount.sjtu.edu.cn/jaccount/jalogin')) {
+              console.warn('[Captcha Auto-Fill] 仍在登录页面，可能登录失败');
+              const warnDiv = document.getElementById('div_warn');
+              if (warnDiv && warnDiv.style.display !== 'none') {
+                const errorText = document.getElementById('span_warn')?.textContent;
+                console.error('[Captcha Auto-Fill] 登录错误:', errorText);
+              }
+            }
+          }, 2000);
+
+          return;
+        }
+
+        // 方案2：如果按钮点击失败，使用 AJAX 提交（备用方案）
+        console.log('[Captcha Auto-Fill] 方案1不可用，尝试方案2：AJAX提交');
+
+        // 使用 fetch 提交登录请求
+        fetch('https://jaccount.sjtu.edu.cn/jaccount/ulogin', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': window.location.href
+          },
+          body: new URLSearchParams(loginData),
+          credentials: 'include'
+        })
+        .then(response => response.json())
+        .then(data => {
+          console.log('[Captcha Auto-Fill] 登录响应:', data);
+          if (data.errno === 0 && data.url) {
+            console.log('[Captcha Auto-Fill] 登录成功，跳转到:', data.url);
+            window.location.href = data.url;
+          } else {
+            console.error('[Captcha Auto-Fill] 登录失败:', data.error);
+            showNotification(data.error || '登录失败', 'error');
+            // 刷新验证码
+            if (typeof window.refreshCaptcha === 'function') {
+              window.refreshCaptcha();
+            }
+          }
+        })
+        .catch(error => {
+          console.error('[Captcha Auto-Fill] 登录请求失败:', error);
+          showNotification('登录请求失败', 'error');
+        });
+
+        return;  // 直接返回，不再执行后续点击逻辑
+      }
+
+      // 方式1：直接调用 click()
+      loginBtn.click();
+      console.log('[Captcha Auto-Fill] 已执行 click()');
+
+      // 方式2：触发 mousedown 和 mouseup 事件（某些表单需要）
+      const mousedownEvent = new MouseEvent('mousedown', {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      });
+      const mouseupEvent = new MouseEvent('mouseup', {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      });
+      const clickEvent = new MouseEvent('click', {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      });
+
+      loginBtn.dispatchEvent(mousedownEvent);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      loginBtn.dispatchEvent(mouseupEvent);
+      await new Promise(resolve => setTimeout(resolve, 50));
+      loginBtn.dispatchEvent(clickEvent);
+      console.log('[Captcha Auto-Fill] 已执行 MouseEvent 点击');
+
+      // 如果上述方式都失败，尝试直接提交表单
+      if (window.location.href.includes('jaccount.sjtu.edu.cn')) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        if (typeof window.checkForm === 'function') {
+          console.log('[Captcha Auto-Fill] checkForm 函数不存在，尝试提交表单');
+          const form = loginBtn.closest('form');
+          if (form) {
+            form.submit();
+            console.log('[Captcha Auto-Fill] 已提交表单');
+          }
+        }
+      }
+    } catch (error) {
+      console.error('[Captcha Auto-Fill] 点击登录按钮时出错:', error);
+    }
   }
 
   /**
-   * 加载引擎配置
+   * 加载引擎配置和账号设置
    */
   async function loadEngineConfig(engine) {
     const keys = [
@@ -1494,9 +2120,17 @@
       'baiduApiKey',
       'baiduSecretKey',
       'aliyunAccessKey',
-      'aliyunAccessSecret'
+      'aliyunAccessSecret',
+      'autoFillCredentials',
+      'jaccountUser',
+      'jaccountPass'
     ];
     const settings = await chrome.storage.sync.get(keys);
+
+    // 更新账号设置
+    autoFillCredentials = settings.autoFillCredentials === true;
+    jaccountUser = settings.jaccountUser || '';
+    jaccountPass = settings.jaccountPass || '';
 
     switch (engine) {
       case 'kimi':

@@ -356,17 +356,15 @@ class CaptchaRecognizer {
         break;
 
       case 'online':
+        // 关键修复：在线 OCR 也需要 base64，如果传入的是 URL，拒绝处理
+        // 因为 fetch URL 会导致验证码刷新
+        if (!isBase64) {
+          console.error('[CaptchaRecognizer] 在线 OCR 需要 base64 图片数据，传入 URL 会导致验证码刷新');
+          return { text: '', confidence: 0 };
+        }
         result = await this.recognizeWithOnlineOcr(imageSrc, imageId);
         if (this.ocrService && this.ocrService.getCurrentImageData()) {
           imageDataForDownload = this.ocrService.getCurrentImageData();
-        }
-        if (!isBase64 && imageDataForDownload === imageSrc) {
-          try {
-            imageDataForDownload = await this.fetchImageAsBase64(imageSrc);
-          } catch (e) {
-            console.warn('[CaptchaRecognizer] 获取在线 OCR 图片失败:', e);
-            imageDataForDownload = imageSrc;
-          }
         }
         break;
 
@@ -454,8 +452,15 @@ class CaptchaRecognizer {
 
   /**
    * 使用本地 ddddocr 服务识别
+   * 关键修复：只接受 base64，拒绝 URL，避免验证码刷新
    */
   async recognizeWithLocal(imageSrc, imageId) {
+    // 检查是否是 base64
+    if (!imageSrc.startsWith('data:')) {
+      console.error('[CaptchaRecognizer] 本地 OCR 只接受 base64 图片数据，传入 URL 会导致验证码刷新');
+      return { text: '', confidence: 0 };
+    }
+
     try {
       const result = await this.recognizeWithLocalOcr(imageSrc);
       console.log('[CaptchaRecognizer] ✅ 本地 OCR 服务识别结果:', result, '图片:', imageId);
@@ -643,8 +648,15 @@ class CaptchaRecognizer {
 
   /**
    * 使用本地算法识别
+   * 关键修复：只接受 base64，拒绝 URL，避免验证码刷新
    */
   async recognizeWithAlgorithm(imageSrc, imageId) {
+    // 检查是否是 base64
+    if (!imageSrc.startsWith('data:')) {
+      console.error('[CaptchaRecognizer] 本地算法只接受 base64 图片数据，传入 URL 会导致验证码刷新');
+      return { text: '', confidence: 0 };
+    }
+
     console.log('[CaptchaRecognizer] 使用本地 JavaScript 算法识别...');
     await this.init();
     const result = await this.recognizeWithLocalAlgorithm(imageSrc);

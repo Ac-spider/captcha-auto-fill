@@ -113,6 +113,7 @@ class BaiduOCR {
 
   /**
    * 将图片转换为 base64
+   * 关键修复：拒绝 URL，避免验证码刷新
    */
   getBase64Image(imageSrc) {
     return new Promise((resolve, reject) => {
@@ -121,6 +122,13 @@ class BaiduOCR {
         return;
       }
 
+      // 关键修复：拒绝 HTTP URL，避免重新加载导致验证码刷新
+      if (imageSrc.startsWith('http')) {
+        reject(new Error('为避免验证码刷新，请传入 base64 图片数据而非 URL'));
+        return;
+      }
+
+      // 对于其他情况，尝试加载（但这不应该发生）
       const img = new Image();
       img.crossOrigin = 'anonymous';
 

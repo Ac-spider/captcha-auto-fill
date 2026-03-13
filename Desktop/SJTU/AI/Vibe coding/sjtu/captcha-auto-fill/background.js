@@ -77,11 +77,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         try {
           let base64Image = request.image;
 
-          // 如果不是 base64，说明是 URL，需要先获取图片
+          // 关键修复：如果不是 base64，说明是 URL，拒绝处理
+          // 因为 fetch 验证码 URL 会导致验证码刷新，使识别结果失效
           if (!request.image.startsWith('data:')) {
-            console.log('[Background] 检测到图片 URL，正在获取图片数据...');
-            base64Image = await fetchImageAsBase64(request.image);
-            console.log('[Background] 图片已转换为 base64，长度:', base64Image.length);
+            console.error('[Background] 拒绝处理 URL 类型的图片请求，因为这会导致验证码刷新');
+            console.error('[Background] 请确保 content.js 中的 getImageData 返回 base64 数据');
+            sendResponse({ success: false, error: '必须使用 base64 图片数据，URL 会导致验证码刷新' });
+            return;
           }
 
           // 发送到 OCR 服务
