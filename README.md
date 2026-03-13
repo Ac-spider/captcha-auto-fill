@@ -136,6 +136,20 @@ python ocr_server.py
 
 服务将在 `http://127.0.0.1:5000` 启动，保持运行即可。
 
+**后台运行（推荐）**：不想每次开机手动启动？可以将 OCR 服务安装为 Windows 系统服务：
+
+```bash
+cd server
+# 右键点击，选择"以管理员身份运行"
+install_service.bat
+```
+
+安装完成后，服务会随系统自动启动，无需手动维护。管理命令：
+- 停止服务：`net stop OCRCaptcha`
+- 启动服务：`net start OCRCaptcha`
+- 卸载服务：运行 `uninstall_service.bat`（管理员身份）
+- 管理工具：运行 `manage_service.bat` 查看图形菜单
+
 #### 方式二：使用 AI 大模型
 
 1. 点击扩展图标打开设置面板
@@ -254,8 +268,12 @@ captcha-auto-fill/
 │   └── aliyun-ocr.js          # 阿里云 OCR 封装
 └── server/                    # Python OCR 服务
     ├── ocr_server.py          # Flask 服务（基于 ddddocr）
+    ├── ocr_service.py         # Windows 服务版本
     ├── start_server.py        # 启动脚本
-    └── requirements.txt       # Python 依赖
+    ├── requirements.txt       # Python 依赖
+    ├── install_service.bat    # 安装 Windows 服务
+    ├── uninstall_service.bat  # 卸载 Windows 服务
+    └── manage_service.bat     # 服务管理工具
 ```
 
 ## 技术栈
